@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -7,7 +7,8 @@ import { createServer } from "./server.js";
 import { getSecurityConfig, getApi, resolveChat, installOutboundProxy, sendServiceMessage } from "./telegram.js";
 import { clearCommandsOnShutdown } from "./shutdown.js";
 import { BUILT_IN_COMMANDS, applySessionLogConfig, doTimelineDump } from "./built-in-commands.js";
-import { startPoller, stopPoller, drainPendingUpdates, waitForPollerExit } from "./poller.js";
+import { startPoller, stopPoller, drainPendingUpdates, waitForPollerExit, onFirstSuccessfulPoll } from "./poller.js";
+import { startInjectServer } from "./inject-server.js";
 import { startHealthCheck } from "./health-check.js";
 import { setAuthHook } from "./session-gate.js";
 import { touchSession } from "./session-manager.js";
@@ -19,6 +20,64 @@ import { initDebugLog } from "./debug-log.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")) as { name: string; version: string };
 process.stderr.write(`[info] [${pkg.name}] v${pkg.version} starting...\n`);
+
+// --- Startup deduplication via PID lockfile ---
+// Use first 8 chars of bot token as a per-bot hash so multiple bots can coexist.
+const _botToken = process.env.BOT_TOKEN ?? "";
+const _tokenHash = _botToken.slice(0, 8) || "default";
+const _lockfilePath = `/tmp/telegram-bridge-${_tokenHash}.pid`;
+
+function _releaseLockfile(): void {
+  try {
+    if (existsSync(_lockfilePath)) unlinkSync(_lockfilePath);
+  } catch { /* best effort */ }
+}
+
+// Check for an existing instance and send SIGTERM if alive.
+if (existsSync(_lockfilePath)) {
+  let existingPid: number | null = null;
+  try {
+    const raw = readFileSync(_lockfilePath, "utf-8").trim();
+    const parsed = parseInt(raw, 10);
+    if (!isNaN(parsed) && parsed > 0) existingPid = parsed;
+  } catch { /* stale or unreadable lockfile — proceed */ }
+
+  if (existingPid !== null) {
+    let isAlive = false;
+    try {
+      process.kill(existingPid, 0);
+      isAlive = true;
+    } catch { /* ESRCH — process is dead */ }
+
+    if (isAlive) {
+      process.stderr.write(`[startup] found existing instance PID ${existingPid}, sending SIGTERM...\n`);
+      try {
+        process.kill(existingPid, "SIGTERM");
+      } catch { /* already dead by the time we got here */ }
+
+      // Wait up to 3 seconds for the old process to exit.
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        let stillAlive = false;
+        try { process.kill(existingPid, 0); stillAlive = true; } catch { /* dead */ }
+        if (!stillAlive) break;
+        // Busy-wait in 100 ms increments — this is startup code, acceptable.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+      process.stderr.write(`[startup] old instance terminated, continuing startup\n`);
+    } else {
+      process.stderr.write(`[startup] stale lockfile for PID ${existingPid}, ignoring\n`);
+    }
+  }
+}
+
+// Write our PID to the lockfile before starting the poller.
+try {
+  writeFileSync(_lockfilePath, String(process.pid), "utf-8");
+} catch (e) {
+  process.stderr.write(`[startup] warning: could not write lockfile ${_lockfilePath}: ${String(e)}\n`);
+}
+// --- End startup deduplication ---
 
 // Initialize security config early so warnings surface at startup
 getSecurityConfig();
@@ -61,7 +120,11 @@ for (const sig of ["SIGTERM", "SIGINT"] as const) {
     })();
     const timeout = new Promise<void>((r) => setTimeout(r, 10000));
     void Promise.race([shutdownSequence, timeout])
-      .finally(() => clearCommandsOnShutdown().finally(() => process.exit(0)));
+      .finally(() => {
+        _releaseLockfile();
+        process.stderr.write("[shutdown] telegram-bridge shutting down gracefully\n");
+        clearCommandsOnShutdown().finally(() => process.exit(0));
+      });
   });
 }
 
@@ -89,13 +152,22 @@ void (async () => {
   } catch { /* ignore */ }
 })();
 
+// Defer the "Online" announcement until after the first successful getUpdates.
+// This prevents duplicate announcements when the old process is still long-polling.
+const logStatus = sessionLogLabel();
+onFirstSuccessfulPoll(() => {
+  void sendServiceMessage(`🟢 Online\nSession record: ${logStatus}\n/session to change settings`).catch(() => {});
+});
+
+// Brief delay before starting the poller to let the old process's long-poll expire
+// after we sent it SIGTERM above. This reduces update-ID gaps from concurrent polls.
+await new Promise<void>(r => setTimeout(r, 2000));
+
 startPoller();
 process.stderr.write("[info] background poller started\n");
+
+startInjectServer();
 
 startHealthCheck();
 setAuthHook(touchSession);
 process.stderr.write("[info] health check started\n");
-
-// Best-effort startup notification — bypasses proxy (operational, not agent content)
-const logStatus = sessionLogLabel();
-void sendServiceMessage(`🟢 Online\nSession record: ${logStatus}\n/session to change settings`).catch(() => {});

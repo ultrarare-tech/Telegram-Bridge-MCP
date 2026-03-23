@@ -38,6 +38,17 @@ const ALLOWED_UPDATES = DEFAULT_ALLOWED_UPDATES as ReadonlyArray<
 let _running = false;
 let _loopPromise: Promise<void> | null = null;
 
+/** Callback fired once after the first successful getUpdates. */
+let _onFirstPoll: (() => void) | null = null;
+
+/**
+ * Register a one-shot callback that fires after the first successful poll.
+ * Used to defer the "🟢 Online" message until we own the getUpdates lock.
+ */
+export function onFirstSuccessfulPoll(cb: () => void): void {
+  _onFirstPoll = cb;
+}
+
 export function startPoller(): void {
   if (_running) return;
   _running = true;
@@ -97,6 +108,14 @@ async function _pollLoop(): Promise<void> {
         timeout: 25,
         allowed_updates: ALLOWED_UPDATES,
       });
+
+      // Fire the one-shot first-poll callback (e.g., "🟢 Online" announcement).
+      // This ensures we only announce after successfully owning the getUpdates lock.
+      if (_onFirstPoll) {
+        const cb = _onFirstPoll;
+        _onFirstPoll = null;
+        try { cb(); } catch { /* best effort */ }
+      }
 
       const allowed = filterAllowedUpdates(updates);
 

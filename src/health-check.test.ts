@@ -71,6 +71,16 @@ function makeSession(sid: number, name: string) {
   return { sid, name, createdAt: new Date().toISOString() };
 }
 
+/**
+ * Run the health check enough times to pass the debounce threshold.
+ * The production code requires UNHEALTHY_DEBOUNCE_COUNT (2) consecutive
+ * unhealthy ticks before alerting, so this helper ticks twice.
+ */
+async function runUntilFlagged(): Promise<void> {
+  await _runHealthCheckNow(); // tick 1: streak=1, below threshold
+  await _runHealthCheckNow(); // tick 2: streak=2, triggers alert
+}
+
 /** Simulate a button press by calling the registered callback hook. */
 function pressButton(callbackData: string): void {
   const [, fn] = mocks.registerCallbackHook.mock.calls[0] as [number, (evt: TimelineEvent) => void];
@@ -89,7 +99,7 @@ function pressButton(callbackData: string): void {
 describe("health-check", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    stopHealthCheck(); // clears _flaggedSids between tests
+    stopHealthCheck(); // clears _flaggedSids and _unhealthyStreak between tests
     mocks.resolveChat.mockReturnValue(12345);
     mocks.sendMessage.mockResolvedValue({ message_id: 999 });
     mocks.editMessageText.mockResolvedValue(undefined);
@@ -110,12 +120,41 @@ describe("health-check", () => {
     });
   });
 
+  describe("debounce behavior", () => {
+    it("does not alert on the first unhealthy tick (below debounce threshold)", async () => {
+      const s = makeSession(2, "Worker");
+      mocks.getUnhealthySessions.mockReturnValue([s]);
+      mocks.getGovernorSid.mockReturnValue(1);
+      await _runHealthCheckNow(); // tick 1 — streak=1
+      expect(mocks.sendServiceMessage).not.toHaveBeenCalled();
+      expect(mocks.markUnhealthy).not.toHaveBeenCalled();
+    });
+
+    it("clears streak when session recovers before debounce threshold", async () => {
+      const s = makeSession(2, "Worker");
+      mocks.getGovernorSid.mockReturnValue(1);
+
+      // Tick 1: unhealthy (streak=1)
+      mocks.getUnhealthySessions.mockReturnValue([s]);
+      await _runHealthCheckNow();
+
+      // Tick 2: recovered — streak should reset
+      mocks.getUnhealthySessions.mockReturnValue([]);
+      await _runHealthCheckNow();
+
+      // Tick 3: unhealthy again (streak=1, not 2)
+      mocks.getUnhealthySessions.mockReturnValue([s]);
+      await _runHealthCheckNow();
+      expect(mocks.sendServiceMessage).not.toHaveBeenCalled(); // still below threshold
+    });
+  });
+
   describe("non-governor unhealthy session", () => {
     it("sends a notification when a non-governor session is unresponsive", async () => {
       const s = makeSession(2, "Worker");
       mocks.getUnhealthySessions.mockReturnValue([s]);
       mocks.getGovernorSid.mockReturnValue(1); // governor is sid 1, not 2
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendServiceMessage).toHaveBeenCalledWith(
         expect.stringContaining("Worker"),
       );
@@ -126,7 +165,7 @@ describe("health-check", () => {
       const s = makeSession(2, "Worker");
       mocks.getUnhealthySessions.mockReturnValue([s]);
       mocks.getGovernorSid.mockReturnValue(1);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.markUnhealthy).toHaveBeenCalledWith(2);
     });
 
@@ -134,8 +173,8 @@ describe("health-check", () => {
       const s = makeSession(2, "Worker");
       mocks.getUnhealthySessions.mockReturnValue([s]);
       mocks.getGovernorSid.mockReturnValue(1);
-      await _runHealthCheckNow();
-      await _runHealthCheckNow(); // second tick — still unhealthy
+      await runUntilFlagged();
+      await _runHealthCheckNow(); // third tick — still unhealthy
       expect(mocks.sendServiceMessage).toHaveBeenCalledTimes(1);
     });
   });
@@ -147,7 +186,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendMessage).toHaveBeenCalledWith(
         12345,
         expect.stringContaining("Primary"),
@@ -161,7 +200,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendServiceMessage).not.toHaveBeenCalled();
     });
 
@@ -171,7 +210,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.registerCallbackHook).toHaveBeenCalledWith(999, expect.any(Function));
     });
   });
@@ -182,7 +221,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov]); // only the governor
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendServiceMessage).toHaveBeenCalledWith(
         expect.stringContaining("no other session"),
       );
@@ -198,7 +237,7 @@ describe("health-check", () => {
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
       mocks.resolveChat.mockReturnValue({ code: "NO_CHAT", message: "not configured" });
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendMessage).not.toHaveBeenCalled();
     });
   });
@@ -211,7 +250,7 @@ describe("health-check", () => {
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
       mocks.getSession.mockReturnValue(next);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton(`hc_reroute_now:2`);
       expect(mocks.setGovernorSid).toHaveBeenCalledWith(2);
     });
@@ -223,7 +262,7 @@ describe("health-check", () => {
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
       mocks.getSession.mockReturnValue(next);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton(`hc_reroute_now:2`);
       expect(mocks.deliverDirectMessage).toHaveBeenCalledWith(
         0,
@@ -239,7 +278,7 @@ describe("health-check", () => {
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
       mocks.getSession.mockReturnValue(next);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton(`hc_reroute_now:2`);
       expect(mocks.editMessageText).toHaveBeenCalledWith(
         12345,
@@ -258,7 +297,7 @@ describe("health-check", () => {
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
       mocks.getSession.mockReturnValue(next);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton(`hc_make_primary:2`);
       expect(mocks.setGovernorSid).toHaveBeenCalledWith(2);
     });
@@ -271,7 +310,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton("hc_wait");
       expect(mocks.setGovernorSid).not.toHaveBeenCalled();
     });
@@ -282,7 +321,7 @@ describe("health-check", () => {
       mocks.getUnhealthySessions.mockReturnValue([gov]);
       mocks.getGovernorSid.mockReturnValue(1);
       mocks.listSessions.mockReturnValue([gov, next]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       pressButton("hc_wait");
       expect(mocks.editMessageText).toHaveBeenCalledWith(
         12345, 999, expect.stringContaining("Waiting"), expect.anything(),
@@ -295,10 +334,10 @@ describe("health-check", () => {
       const s = makeSession(2, "Worker");
       mocks.getUnhealthySessions.mockReturnValue([s]);
       mocks.getGovernorSid.mockReturnValue(1);
-      await _runHealthCheckNow(); // tick 1 — flags session
+      await runUntilFlagged(); // ticks 1-2: flags session
 
       mocks.getUnhealthySessions.mockReturnValue([]); // session recovered
-      await _runHealthCheckNow(); // tick 2 — detects recovery
+      await _runHealthCheckNow(); // tick 3: detects recovery
       expect(mocks.sendServiceMessage).toHaveBeenCalledWith(
         expect.stringContaining("back online"),
       );
@@ -308,19 +347,19 @@ describe("health-check", () => {
       const s = makeSession(2, "Worker");
       mocks.getGovernorSid.mockReturnValue(1);
 
-      // Tick 1: flag
+      // Ticks 1-2: flag (debounce passes)
       mocks.getUnhealthySessions.mockReturnValue([s]);
-      await _runHealthCheckNow();
-      expect(mocks.sendServiceMessage).toHaveBeenCalledTimes(1);
+      await runUntilFlagged();
+      expect(mocks.sendServiceMessage).toHaveBeenCalledTimes(1); // "unresponsive"
 
-      // Tick 2: recover
+      // Tick 3: recover
       mocks.getUnhealthySessions.mockReturnValue([]);
       await _runHealthCheckNow();
       expect(mocks.sendServiceMessage).toHaveBeenCalledTimes(2); // recovery msg
 
-      // Tick 3: goes unhealthy again
+      // Ticks 4-5: goes unhealthy again (streak resets, must debounce again)
       mocks.getUnhealthySessions.mockReturnValue([s]);
-      await _runHealthCheckNow();
+      await runUntilFlagged();
       expect(mocks.sendServiceMessage).toHaveBeenCalledTimes(3); // re-flagged
     });
   });

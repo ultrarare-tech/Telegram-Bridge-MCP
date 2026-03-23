@@ -33,9 +33,16 @@ export const CHECK_INTERVAL_MS = 60_000;
 
 /**
  * How long a session can go without any tool activity before it is considered
- * unhealthy. Set to 10 minutes to allow room for long-running local operations.
+ * unhealthy. Set to 20 minutes to allow room for long-running local operations,
+ * heavy delegation sequences, and message-bus relay waits.
  */
-export const HEALTH_THRESHOLD_MS = 600_000;
+export const HEALTH_THRESHOLD_MS = 1_200_000;
+
+/**
+ * Number of consecutive unhealthy checks before alerting the operator.
+ * Prevents false positives from single slow cycles.
+ */
+const UNHEALTHY_DEBOUNCE_COUNT = 2;
 
 const CB_REROUTE_NOW  = "hc_reroute_now";
 const CB_MAKE_PRIMARY = "hc_make_primary";
@@ -45,6 +52,9 @@ const CB_WAIT         = "hc_wait";
 
 /** SIDs of sessions that have already been flagged to the operator. */
 const _flaggedSids = new Set<number>();
+
+/** Consecutive unhealthy tick count per SID. Must hit UNHEALTHY_DEBOUNCE_COUNT before alerting. */
+const _unhealthyStreak = new Map<number, number>();
 
 let _intervalHandle: ReturnType<typeof setInterval> | undefined;
 
@@ -142,19 +152,37 @@ async function runHealthCheck(thresholdMs: number): Promise<void> {
     if (unhealthySids.has(sid)) continue; // still unresponsive
     // Session has polled again — it's healthy again.
     _flaggedSids.delete(sid);
+    _unhealthyStreak.delete(sid);
     const session = getSession(sid);
     const name = session?.name ?? `Session ${sid}`;
     void sendServiceMessage(`✅ ${name} is back online.`).catch(() => {});
     dlog("health", `session recovered sid=${sid} name=${name}`);
   }
 
-  // ── Newly unhealthy sessions ──────────────────────────
+  // Clear streak counters for sessions that recovered before being flagged
+  for (const sid of [..._unhealthyStreak.keys()]) {
+    if (!unhealthySids.has(sid)) {
+      _unhealthyStreak.delete(sid);
+    }
+  }
+
+  // ── Newly unhealthy sessions (debounced) ───────────────
   for (const session of unhealthy) {
     if (_flaggedSids.has(session.sid)) continue; // already handled
     if (hasActiveAnimation(session.sid)) continue; // animation = proof of life
+
+    // Increment streak; only alert after UNHEALTHY_DEBOUNCE_COUNT consecutive ticks
+    const streak = (_unhealthyStreak.get(session.sid) ?? 0) + 1;
+    _unhealthyStreak.set(session.sid, streak);
+
+    if (streak < UNHEALTHY_DEBOUNCE_COUNT) {
+      dlog("health", `session unhealthy sid=${session.sid} streak=${streak}/${UNHEALTHY_DEBOUNCE_COUNT}, waiting`);
+      continue;
+    }
+
     _flaggedSids.add(session.sid);
     markUnhealthy(session.sid);
-    dlog("health", `session unhealthy sid=${session.sid} name=${session.name}`);
+    dlog("health", `session unhealthy sid=${session.sid} name=${session.name} (confirmed after ${streak} ticks)`);
 
     const isGovernor = session.sid === governorSid && governorSid > 0;
 
@@ -198,6 +226,7 @@ export function stopHealthCheck(): void {
     _intervalHandle = undefined;
   }
   _flaggedSids.clear();
+  _unhealthyStreak.clear();
 }
 
 /** Exposed for tests — directly run one health check tick. */
