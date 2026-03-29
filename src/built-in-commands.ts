@@ -84,6 +84,8 @@ export function setAutoDumpThreshold(threshold: number | null): void {
 /**
  * Apply session log mode from persistent config.
  * Wires up auto-dump if mode is a number; disables it otherwise.
+ * Also registers the shutdown dump hook (deferred here to avoid TDZ caused
+ * by the circular import chain: built-in-commands → shutdown → poller → built-in-commands).
  */
 export function applySessionLogConfig(): void {
   const mode = getSessionLogMode();
@@ -92,19 +94,17 @@ export function applySessionLogConfig(): void {
   } else {
     setAutoDumpThreshold(null);
   }
+  setShutdownDumpHook(async () => {
+    if (getSessionLogMode() !== null) {
+      await doTimelineDump(true);
+    }
+  });
 }
 
 /** Current auto-dump threshold (null = disabled). */
 export function getAutoDumpThresholdValue(): number | null {
   return _autoDumpThreshold;
 }
-
-// Wire up the session-log dump hook for elegant shutdown (avoids circular import)
-setShutdownDumpHook(async () => {
-  if (getSessionLogMode() !== null) {
-    await doTimelineDump(true);
-  }
-});
 
 /**
  * Unix timestamp (seconds) captured at module load — used to discard stale

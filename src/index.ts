@@ -2,14 +2,13 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createServer } from "./server.js";
 import { getSecurityConfig, getApi, resolveChat, installOutboundProxy, sendServiceMessage } from "./telegram.js";
 import { clearCommandsOnShutdown } from "./shutdown.js";
 import { BUILT_IN_COMMANDS, applySessionLogConfig, doTimelineDump } from "./built-in-commands.js";
 import { startPoller, stopPoller, drainPendingUpdates, waitForPollerExit, onFirstSuccessfulPoll } from "./poller.js";
 import { startInjectServer } from "./inject-server.js";
 import { startHealthCheck } from "./health-check.js";
+import { startHttpMcpServer } from "./http-server.js";
 import { setAuthHook } from "./session-gate.js";
 import { touchSession } from "./session-manager.js";
 import { createOutboundProxy } from "./outbound-proxy.js";
@@ -128,17 +127,16 @@ for (const sig of ["SIGTERM", "SIGINT"] as const) {
   });
 }
 
-const server = createServer();
-
 // Install the outbound proxy before any API calls
 installOutboundProxy(createOutboundProxy);
 
 // Apply session log config (wires up auto-dump if configured)
 applySessionLogConfig();
 
-const transport = new StdioServerTransport();
-
-await server.connect(transport);
+// Start the HTTP MCP server — each connecting Claude session gets its own
+// McpServer+transport pair; all share the same module-level Telegram state.
+const _mcpPort = parseInt(process.env.MCP_PORT ?? "3001", 10);
+startHttpMcpServer(_mcpPort);
 
 // Register built-in commands and start the background poller after connecting.
 // Both are best-effort — don't block startup.
