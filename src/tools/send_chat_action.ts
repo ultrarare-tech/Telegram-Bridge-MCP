@@ -1,12 +1,18 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getApi, toResult, toError, resolveChat } from "../telegram.js";
+import { requireAuth } from "../session-gate.js";
+import { IDENTITY_SCHEMA } from "./identity-schema.js";
+
+const DESCRIPTION =
+  'Sends a one-shot chat action indicator (e.g. "typing\u2026") that lasts ~5 s. ' +
+  'For sustained typing, use show_typing instead.';
 
 export function register(server: McpServer) {
   server.registerTool(
     "send_chat_action",
     {
-      description: 'Sends a one-shot chat action indicator (e.g. "typing\u2026") that lasts ~5 s. For sustained typing, use show_typing instead.',
+      description: DESCRIPTION,
       inputSchema: {
         action: z
         .enum([
@@ -24,11 +30,14 @@ export function register(server: McpServer) {
         ])
         .default("typing")
         .describe('Action to broadcast. Defaults to "typing".'),
-      },
+              identity: IDENTITY_SCHEMA,
+},
     },
-    async ({ action }) => {
+    async ({ action, identity}) => {
+      const _sid = requireAuth(identity);
+      if (typeof _sid !== "number") return toError(_sid);
       const chatId = resolveChat();
-      if (typeof chatId !== "string") return toError(chatId);
+      if (typeof chatId !== "number") return toError(chatId);
       try {
         await getApi().sendChatAction(chatId, action);
         return toResult({ ok: true });

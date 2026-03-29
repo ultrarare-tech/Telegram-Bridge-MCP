@@ -1,12 +1,21 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getApi, toResult, toError } from "../telegram.js";
+import { requireAuth } from "../session-gate.js";
+import { IDENTITY_SCHEMA } from "./identity-schema.js";
+
+const DESCRIPTION =
+  "Acknowledges a callback query from an inline button press. " +
+  "Only needed when handling button presses manually via send_message with a keyboard — " +
+  "choose, confirm, and send_choice auto-ack button presses automatically. " +
+  "Must be called within 30 s of receiving the update. " +
+  "Optionally shows a toast or alert to the user.";
 
 export function register(server: McpServer) {
   server.registerTool(
     "answer_callback_query",
     {
-      description: "Acknowledges a callback query from an inline button press. Must be called within 30 s of receiving the update. Optionally shows a toast or alert to the user.",
+      description: DESCRIPTION,
       inputSchema: {
         callback_query_id: z.string().describe("ID from the callback_query update"),
       text: z
@@ -26,9 +35,12 @@ export function register(server: McpServer) {
         .int()
         .optional()
         .describe("Seconds the result may be cached client-side"),
-      },
+              identity: IDENTITY_SCHEMA,
+},
     },
-    async ({ callback_query_id, text, show_alert, url, cache_time }) => {
+    async ({ callback_query_id, text, show_alert, url, cache_time, identity}) => {
+      const _sid = requireAuth(identity);
+      if (typeof _sid !== "number") return toError(_sid);
       try {
         const ok = await getApi().answerCallbackQuery(callback_query_id, {
           text,

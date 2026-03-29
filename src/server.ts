@@ -2,120 +2,184 @@ import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { runInSessionContext } from "./session-context.js";
+import { getActiveSession } from "./session-manager.js";
 
-// Low-level tools
-import { register as registerGetMe } from "./tools/get_me.js";
+import { register as registerDequeueUpdate } from "./tools/dequeue_update.js";
+import { register as registerGetMessage } from "./tools/get_message.js";
+import { register as registerGetChatHistory } from "./tools/get_chat_history.js";
+import { register as registerSendText } from "./tools/send_text.js";
 import { register as registerSendMessage } from "./tools/send_message.js";
-import { register as registerSendMessageDraft } from "./tools/send_message_draft.js";
-import { register as registerGetUpdates } from "./tools/get_updates.js";
-import { register as registerGetUpdate } from "./tools/get_update.js";
-import { register as registerAnswerCallbackQuery } from "./tools/answer_callback_query.js";
-import { register as registerEditMessageText } from "./tools/edit_message_text.js";
-import { register as registerGetChat } from "./tools/get_chat.js";
-import { register as registerSetReaction } from "./tools/set_reaction.js";
-import { register as registerSendPhoto } from "./tools/send_photo.js";
-import { register as registerSendDocument } from "./tools/send_document.js";
-import { register as registerSendVideo } from "./tools/send_video.js";
-import { register as registerSendAudio } from "./tools/send_audio.js";
-import { register as registerSendVoiceTool } from "./tools/send_voice.js";
-import { register as registerSendTextAsVoice } from "./tools/speak.js";
-import { register as registerDownloadFile } from "./tools/download_file.js";
-import { register as registerTranscribeVoice } from "./tools/transcribe_voice.js";
-import { register as registerForwardMessage } from "./tools/forward_message.js";
-import { register as registerPinMessage } from "./tools/pin_message.js";
-import { register as registerUnpinMessage } from "./tools/unpin_message.js";
-import { register as registerDeleteMessage } from "./tools/delete_message.js";
-import { register as registerSendChatAction } from "./tools/send_chat_action.js";
-import { register as registerShowTyping } from "./tools/show_typing.js";
-import { register as registerCancelTyping } from "./tools/cancel_typing.js";
-import { register as registerRestartServer } from "./tools/restart_server.js";
-import { register as registerSetCommands } from "./tools/set_commands.js";
-import { register as registerWaitForCallbackQuery } from "./tools/wait_for_callback_query.js";
-import { register as registerWaitForMessage } from "./tools/wait_for_message.js";
-
-// High-level agent tools
+import { register as registerSendChoice } from "./tools/send_choice.js";
+import { register as registerSendFile } from "./tools/send_file.js";
+import { register as registerAppendText } from "./tools/append_text.js";
+import { register as registerShowAnimation } from "./tools/show_animation.js";
+import { register as registerCancelAnimation } from "./tools/cancel_animation.js";
+import { register as registerSetDefaultAnimation } from "./tools/set_default_animation.js";
+import { register as registerSendTextAsVoice } from "./tools/send_text_as_voice.js";
 import { register as registerNotify } from "./tools/notify.js";
+import { register as registerEditMessageText } from "./tools/edit_message_text.js";
+import { register as registerEditMessage } from "./tools/edit_message.js";
+import { register as registerDeleteMessage } from "./tools/delete_message.js";
 import { register as registerAsk } from "./tools/ask.js";
 import { register as registerChoose } from "./tools/choose.js";
-import { register as registerUpdateStatus } from "./tools/update_status.js";
-import { register as registerGetAgentGuide } from "./tools/get_agent_guide.js";
-import { register as registerSendConfirmation } from "./tools/send_confirmation.js";
+import { register as registerConfirm } from "./tools/confirm.js";
+import { register as registerAnswerCallbackQuery } from "./tools/answer_callback_query.js";
+import { register as registerShowTyping } from "./tools/show_typing.js";
+import { register as registerSendChatAction } from "./tools/send_chat_action.js";
+import { register as registerSendNewChecklist } from "./tools/send_new_checklist.js";
+import { register as registerSetReaction } from "./tools/set_reaction.js";
+import { register as registerPinMessage } from "./tools/pin_message.js";
+import { register as registerDownloadFile } from "./tools/download_file.js";
+import { register as registerTranscribeVoice } from "./tools/transcribe_voice.js";
+import { register as registerSetCommands } from "./tools/set_commands.js";
 import { register as registerSetTopic } from "./tools/set_topic.js";
-import { register as registerSendTempMessage } from "./tools/send_temp_message.js";
-import { register as registerStartSessionRecording } from "./tools/start_session_recording.js";
-import { register as registerCancelSessionRecording } from "./tools/cancel_session_recording.js";
-import { register as registerGetSessionUpdates } from "./tools/get_session_updates.js";
+import { register as registerGetMe } from "./tools/get_me.js";
+import { register as registerGetChat } from "./tools/get_chat.js";
+import { register as registerGetAgentGuide } from "./tools/get_agent_guide.js";
 import { register as registerDumpSessionRecord } from "./tools/dump_session_record.js";
+import { register as registerShutdownServer } from "./tools/shutdown.js";
+import { register as registerSessionStart } from "./tools/session_start.js";
+import { register as registerCloseSession } from "./tools/close_session.js";
+import { register as registerListSessions } from "./tools/list_sessions.js";
+import { register as registerSendNewProgress } from "./tools/send_new_progress.js";
+import { register as registerUpdateProgress } from "./tools/update_progress.js";
+import { register as registerSendDirectMessage } from "./tools/send_direct_message.js";
+import { register as registerRouteMessage } from "./tools/route_message.js";
+import { register as registerRenameSession } from "./tools/rename_session.js";
+import { register as registerGetDebugLog } from "./tools/get_debug_log.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "telegram-bridge-mcp",
-    version: "1.15.1",
+    version: "3.0.0",
   });
+
+  // ── Session context middleware ──────────────────────────────────────────
+  // Wrap every tool handler in AsyncLocalStorage so outbound messages
+  // are attributed to the correct session even when multiple sessions
+  // interleave tool calls concurrently.
+  const _origRegisterTool = server.registerTool.bind(server);
+  type AnyConfig = Parameters<typeof _origRegisterTool>[1];
+  type AnyCallback = Parameters<typeof _origRegisterTool>[2];
+  // `any[]` is intentional: this wrapper must accept any tool callback signature
+  // without knowing the parameter types at compile time. The real type safety
+  // lives in individual tool registrations via their Zod inputSchema.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type CallableCb = (...a: any[]) => unknown;
+  server.registerTool = ((
+    name: string,
+    config: AnyConfig,
+    cb: AnyCallback,
+  ) => {
+    // Inject optional `sid` into every tool's inputSchema so agents
+    // can identify themselves without per-tool changes.
+    const cfg = config as Record<string, unknown>;
+    const schema = cfg.inputSchema as
+      Record<string, unknown> | undefined;
+    if (schema && !("sid" in schema)) {
+      schema.sid = z.number()
+        .int().positive().optional()
+        .describe("Session ID (from session_start). " +
+          "Pass this in multi-session setups.");
+    }
+    const original = cb as unknown as CallableCb;
+    const wrappedCb = (
+      (args: Record<string, unknown>, extra: unknown) => {
+        const sid = (Array.isArray(args.identity) && typeof args.identity[0] === "number")
+          ? args.identity[0]
+          : (typeof args.sid === "number"
+            ? args.sid
+            : getActiveSession());
+        if (sid > 0) {
+          return runInSessionContext(sid, () =>
+            original(args, extra),
+          );
+        }
+        return original(args, extra);
+      }
+    ) as typeof cb;
+    return _origRegisterTool(name, config, wrappedCb);
+  }) as typeof server.registerTool;
 
   // ── High-level agent tools (use these 99% of the time) ─────────────────
   registerGetAgentGuide(server);
   registerSetTopic(server);
   registerNotify(server);
-  registerSendTempMessage(server);
   registerAsk(server);
-  registerChoose(server);
-  registerUpdateStatus(server);
-  registerSendConfirmation(server);
+  registerChoose(server);  registerSendChoice(server);  registerSendNewChecklist(server);  registerSendNewProgress(server);
+  registerConfirm(server);
 
-  // ── Interaction primitives ───────────────────────────────────────────────
-  registerWaitForCallbackQuery(server);
-  registerWaitForMessage(server);
-  registerAnswerCallbackQuery(server);
+  // ── Polling ─────────────────────────────────────────────────────────────
+  registerDequeueUpdate(server);
+  registerGetMessage(server);
+  registerGetChatHistory(server);
 
   // ── Messaging ───────────────────────────────────────────────────────────
-  registerSendChatAction(server);
-  registerShowTyping(server);
-  registerCancelTyping(server);
-  registerRestartServer(server);
   registerSendMessage(server);
-  registerSendMessageDraft(server);
-  registerEditMessageText(server);
-  registerSendPhoto(server);
-  registerSendDocument(server);
-  registerSendVideo(server);
-  registerSendAudio(server);
-  registerSendVoiceTool(server);
+  registerEditMessage(server);
+  registerSendText(server);
   registerSendTextAsVoice(server);
-  registerDownloadFile(server);
-  registerTranscribeVoice(server);
-  registerForwardMessage(server);
+  registerSendFile(server);
+  registerEditMessageText(server);
+  registerAppendText(server);
   registerDeleteMessage(server);
-  registerPinMessage(server);
-  registerUnpinMessage(server);
 
-  // ── Bot / chat info ──────────────────────────────────────────────────────
-  registerGetMe(server);
-  registerGetChat(server);
-  registerSetCommands(server);
+  // ── Visual (animations) ────────────────────────────────────────────────
+  registerShowAnimation(server);
+  registerCancelAnimation(server);
+  registerSetDefaultAnimation(server);
 
-  // ── Reactions ────────────────────────────────────────────────────────────
+  // ── Interaction primitives ─────────────────────────────────────────────
+  registerAnswerCallbackQuery(server);
+
+  // ── Status ─────────────────────────────────────────────────────────────
+  registerShowTyping(server);
+  registerSendChatAction(server);
+
+  // ── Reactions ──────────────────────────────────────────────────────────
   registerSetReaction(server);
 
-  // ── Polling ──────────────────────────────────────────────────────────────
-  registerGetUpdate(server);
-  registerGetUpdates(server);
+  // ── Pin ────────────────────────────────────────────────────────────────
+  registerPinMessage(server);
 
-  // ── Session recording ───────────────────────────────────────────
-  registerStartSessionRecording(server);
-  registerCancelSessionRecording(server);
-  registerGetSessionUpdates(server);
+  // ── File operations ────────────────────────────────────────────────────
+  registerDownloadFile(server);
+  registerTranscribeVoice(server);
+
+  // ── Config ─────────────────────────────────────────────────────────────
+  registerSetCommands(server);
+
+  // ── Info ───────────────────────────────────────────────────────────────
+  registerGetMe(server);
+  registerGetChat(server);
+
+  // ── Progress ───────────────────────────────────────────────────────────
+  registerUpdateProgress(server);
+
+  // ── Session ────────────────────────────────────────────────────────────
+  registerSessionStart(server);
+  registerCloseSession(server);
+  registerListSessions(server);
+  registerSendDirectMessage(server);
+  registerRouteMessage(server);
+  registerRenameSession(server);
   registerDumpSessionRecord(server);
+  registerGetDebugLog(server);
+
+  // ── System ─────────────────────────────────────────────────────────────
+  registerShutdownServer(server);
 
   // ── Resources ────────────────────────────────────────────────────────────
   const agentGuideContent = readFileSync(
-    join(__dirname, "..", "BEHAVIOR.md"),
+    join(__dirname, "..", "docs", "behavior.md"),
     "utf-8"
   );
   const communicationContent = readFileSync(
-    join(__dirname, "..", "COMMUNICATION.md"),
+    join(__dirname, "..", "docs", "communication.md"),
     "utf-8"
   );
   // Strip YAML frontmatter (--- ... ---) before serving as a resource
@@ -125,19 +189,19 @@ export function createServer(): McpServer {
   );
   const quickReferenceContent = quickReferenceRaw.replace(/^---[\s\S]*?---\n/, "").trimStart();
   const setupContent = readFileSync(
-    join(__dirname, "..", "SETUP.md"),
+    join(__dirname, "..", "docs", "setup.md"),
     "utf-8"
   );
   const formattingContent = readFileSync(
-    join(__dirname, "..", "FORMATTING.md"),
+    join(__dirname, "..", "docs", "formatting.md"),
     "utf-8"
   );
 
-  server.resource(
+  server.registerResource(
     "agent-guide",
     "telegram-bridge-mcp://agent-guide",
     { mimeType: "text/markdown", description: "Agent behavior guide for this MCP server. Read this at session start to understand how to communicate with the user and which tools to use." },
-    async () => ({
+    () => ({
       contents: [
         {
           uri: "telegram-bridge-mcp://agent-guide",
@@ -148,11 +212,11 @@ export function createServer(): McpServer {
     })
   );
 
-  server.resource(
+  server.registerResource(
     "communication-guide",
     "telegram-bridge-mcp://communication-guide",
     { mimeType: "text/markdown", description: "Compact Telegram communication patterns: tool selection, hard rules, commit/push flow, multi-step tasks, and loop behavior." },
-    async () => ({
+    () => ({
       contents: [
         {
           uri: "telegram-bridge-mcp://communication-guide",
@@ -163,11 +227,11 @@ export function createServer(): McpServer {
     })
   );
 
-  server.resource(
+  server.registerResource(
     "quick-reference",
     "telegram-bridge-mcp://quick-reference",
     { mimeType: "text/markdown", description: "Hard rules + tool selection table for Telegram communication. Minimal injected rules card — full detail in communication-guide." },
-    async () => ({
+    () => ({
       contents: [
         {
           uri: "telegram-bridge-mcp://quick-reference",
@@ -178,11 +242,11 @@ export function createServer(): McpServer {
     })
   );
 
-  server.resource(
+  server.registerResource(
     "setup-guide",
     "telegram-bridge-mcp://setup-guide",
     { mimeType: "text/markdown", description: "Step-by-step guide to creating a Telegram bot and running pnpm pair to configure this MCP server." },
-    async () => ({
+    () => ({
       contents: [
         {
           uri: "telegram-bridge-mcp://setup-guide",
@@ -193,11 +257,11 @@ export function createServer(): McpServer {
     })
   );
 
-  server.resource(
+  server.registerResource(
     "formatting-guide",
     "telegram-bridge-mcp://formatting-guide",
     { mimeType: "text/markdown", description: "Reference for Markdown/HTML/MarkdownV2 formatting in Telegram messages. Consult this when unsure how to format text." },
-    async () => ({
+    () => ({
       contents: [
         {
           uri: "telegram-bridge-mcp://formatting-guide",

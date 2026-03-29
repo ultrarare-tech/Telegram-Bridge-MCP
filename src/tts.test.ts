@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { isTtsEnabled, stripForTts, synthesizeToOgg, TTS_LIMIT, _resetLocalPipeline } from "./tts.js";
+import { describe, it, expect, vi, afterEach, beforeEach, type Mock } from "vitest";
+import { isTtsEnabled, stripForTts, synthesizeToOgg, fetchVoiceList, TTS_LIMIT, _resetLocalPipeline } from "./tts.js";
 
 // Mock @huggingface/transformers so no model is downloaded during tests
 vi.mock("@huggingface/transformers", () => ({
@@ -15,6 +15,11 @@ vi.mock("./ogg-opus-encoder.js", () => ({
 vi.mock("audio-decode", () => ({
   default: vi.fn(),
 }));
+
+type LocalSynthesizer = (text: string) => Promise<{
+  audio: Float32Array;
+  sampling_rate: number;
+}>;
 
 // ---------------------------------------------------------------------------
 // isTtsEnabled
@@ -157,16 +162,16 @@ describe("synthesizeToOgg (openai provider)", () => {
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
     const fakePcm = new Float32Array([0.05, -0.05, 0.0]);
-    vi.mocked(decode as any).mockResolvedValue({
+    vi.mocked(decode).mockResolvedValue({
       sampleRate: 24000,
-      getChannelData: () => fakePcm,
+      channelData: [fakePcm],
     });
     const fakeOgg = Buffer.from("fake-ogg");
     vi.mocked(pcmToOggOpus).mockResolvedValue(fakeOgg);
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => new ArrayBuffer(8),
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -192,7 +197,7 @@ describe("synthesizeToOgg (openai provider)", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: false,
       status: 401,
-      text: async () => "Unauthorized",
+      text: () => Promise.resolve("Unauthorized"),
     }));
 
     await expect(synthesizeToOgg("hello")).rejects.toThrow("401");
@@ -221,16 +226,16 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
     const fakePcm = new Float32Array([0.1, -0.1, 0.0]);
-    vi.mocked(decode as any).mockResolvedValue({
+    vi.mocked(decode).mockResolvedValue({
       sampleRate: 24000,
-      getChannelData: () => fakePcm,
+      channelData: [fakePcm],
     });
     const fakeOgg = Buffer.from("fake-ogg");
     vi.mocked(pcmToOggOpus).mockResolvedValue(fakeOgg);
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => new ArrayBuffer(8),
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -252,15 +257,15 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
     const { default: decode } = await import("audio-decode");
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
-    vi.mocked(decode as any).mockResolvedValue({
+    vi.mocked(decode).mockResolvedValue({
       sampleRate: 24000,
-      getChannelData: () => new Float32Array(1),
+      channelData: [new Float32Array(1)],
     });
     vi.mocked(pcmToOggOpus).mockResolvedValue(Buffer.alloc(4));
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => new ArrayBuffer(8),
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -276,10 +281,10 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
 
     const { default: decode } = await import("audio-decode");
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
-    vi.mocked(decode as any).mockResolvedValue({ sampleRate: 24000, getChannelData: () => new Float32Array(1) });
+    vi.mocked(decode).mockResolvedValue({ sampleRate: 24000, channelData: [new Float32Array(1)] });
     vi.mocked(pcmToOggOpus).mockResolvedValue(Buffer.alloc(4));
 
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
     vi.stubGlobal("fetch", mockFetch);
 
     await synthesizeToOgg("test");
@@ -295,7 +300,7 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: false,
       status: 500,
-      text: async () => "Internal Server Error",
+      text: () => Promise.resolve("Internal Server Error"),
     }));
 
     await expect(synthesizeToOgg("hello")).rejects.toThrow("500");
@@ -312,11 +317,11 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
     // Use an isolated ArrayBuffer so Buffer.from(arrayBuffer) in the impl
     // produces exactly the same bytes (pooled buffers have extra padding).
     const bytes = Buffer.from("fake-native-ogg");
-    const arrBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const arrBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     const fakeOgg = Buffer.from(arrBuf);
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => arrBuf,
+      arrayBuffer: () => Promise.resolve(arrBuf),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -336,7 +341,7 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      arrayBuffer: async () => Buffer.from("fake-ogg").buffer,
+      arrayBuffer: () => Promise.resolve(Buffer.from("fake-ogg").buffer),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -358,8 +363,8 @@ describe("synthesizeToOgg (TTS_HOST provider)", () => {
     process.env.TTS_VOICE = "af_heart";
 
     const bytes = Buffer.from("fake-kokoro-ogg");
-    const arrBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: async () => arrBuf });
+    const arrBuf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: () => Promise.resolve(arrBuf) });
     vi.stubGlobal("fetch", mockFetch);
 
     const result = await synthesizeToOgg("hello kokoro");
@@ -398,7 +403,8 @@ describe("synthesizeToOgg (local provider)", () => {
 
     const fakePcm = new Float32Array([0.1, -0.1, 0.0]);
     const fakeSynthesizer = vi.fn().mockResolvedValue({ audio: fakePcm, sampling_rate: 16000 });
-    vi.mocked(pipeline as any).mockResolvedValue(fakeSynthesizer);
+    (vi.mocked(pipeline) as unknown as Mock<(...args: unknown[]) => Promise<unknown>>)
+      .mockResolvedValue(fakeSynthesizer as unknown as LocalSynthesizer);
 
     const fakeOgg = Buffer.from("fake-ogg");
     vi.mocked(pcmToOggOpus).mockResolvedValue(fakeOgg);
@@ -415,8 +421,12 @@ describe("synthesizeToOgg (local provider)", () => {
     const { pipeline } = await import("@huggingface/transformers");
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
-    const fakeSynthesizer = vi.fn().mockResolvedValue({ audio: new Float32Array(1), sampling_rate: 22050 });
-    vi.mocked(pipeline as any).mockResolvedValue(fakeSynthesizer);
+    const fakeSynthesizer = vi.fn<LocalSynthesizer>().mockResolvedValue({
+      audio: new Float32Array(1),
+      sampling_rate: 22050,
+    });
+    (vi.mocked(pipeline) as unknown as Mock<(...args: unknown[]) => Promise<unknown>>)
+      .mockResolvedValue(fakeSynthesizer as unknown as LocalSynthesizer);
     vi.mocked(pcmToOggOpus).mockResolvedValue(Buffer.alloc(4));
 
     await synthesizeToOgg("test");
@@ -428,8 +438,12 @@ describe("synthesizeToOgg (local provider)", () => {
     const { pipeline } = await import("@huggingface/transformers");
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
-    const fakeSynthesizer = vi.fn().mockResolvedValue({ audio: new Float32Array(1), sampling_rate: 16000 });
-    vi.mocked(pipeline as any).mockResolvedValue(fakeSynthesizer);
+    const fakeSynthesizer = vi.fn<LocalSynthesizer>().mockResolvedValue({
+      audio: new Float32Array(1),
+      sampling_rate: 16000,
+    });
+    (vi.mocked(pipeline) as unknown as Mock<(...args: unknown[]) => Promise<unknown>>)
+      .mockResolvedValue(fakeSynthesizer as unknown as LocalSynthesizer);
     vi.mocked(pcmToOggOpus).mockResolvedValue(Buffer.alloc(4));
 
     await synthesizeToOgg("first call");
@@ -445,12 +459,132 @@ describe("synthesizeToOgg (local provider)", () => {
     const { pipeline } = await import("@huggingface/transformers");
     const { pcmToOggOpus } = await import("./ogg-opus-encoder.js");
 
-    const fakeSynthesizer = vi.fn().mockResolvedValue({ audio: new Float32Array(1), sampling_rate: 16000 });
-    vi.mocked(pipeline as any).mockResolvedValue(fakeSynthesizer);
+    const fakeSynthesizer = vi.fn<LocalSynthesizer>().mockResolvedValue({
+      audio: new Float32Array(1),
+      sampling_rate: 16000,
+    });
+    (vi.mocked(pipeline) as unknown as Mock<(...args: unknown[]) => Promise<unknown>>)
+      .mockResolvedValue(fakeSynthesizer as unknown as LocalSynthesizer);
     vi.mocked(pcmToOggOpus).mockResolvedValue(Buffer.alloc(4));
 
     const result = await synthesizeToOgg("hello");
     expect(fakeSynthesizer).toHaveBeenCalledWith("hello");
     expect(Buffer.isBuffer(result)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchVoiceList
+// ---------------------------------------------------------------------------
+
+describe("fetchVoiceList", () => {
+  afterEach(() => {
+    delete process.env.TTS_HOST;
+    delete process.env.TTS_VOICES_URL;
+    vi.unstubAllGlobals();
+  });
+
+  it("returns empty array when TTS_HOST is not set", async () => {
+    const result = await fetchVoiceList();
+    expect(result).toEqual([]);
+  });
+
+  it("returns empty array when fetch returns non-ok status", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }));
+    const result = await fetchVoiceList();
+    expect(result).toEqual([]);
+  });
+
+  it("returns empty array when fetch throws", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network error")));
+    const result = await fetchVoiceList();
+    expect(result).toEqual([]);
+  });
+
+  it("uses TTS_VOICES_URL override when set", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    process.env.TTS_VOICES_URL = "http://other-host/voices";
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+    await fetchVoiceList();
+    expect(mockFetch.mock.calls[0][0]).toBe("http://other-host/voices");
+  });
+
+  it("parses { voices: [{ voice_id, name, language, gender }] } (Kokoro-style)", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        voices: [{ voice_id: "af_heart", name: "Heart", language: "en", gender: "female" }],
+      }),
+    }));
+    const result = await fetchVoiceList();
+    expect(result).toEqual([{ name: "af_heart", description: "Heart", language: "en", gender: "female" }]);
+  });
+
+  it("parses { voices: [{ name }] } (plain objects)", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ voices: [{ name: "nova" }, { name: "echo" }] }),
+    }));
+    const result = await fetchVoiceList();
+    expect(result.map(v => v.name)).toEqual(["nova", "echo"]);
+  });
+
+  it("parses { voices: ['name', ...] } (string list)", async () => {
+    process.env.TTS_HOST = "http://kokoro.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ voices: ["alloy", "shimmer"] }),
+    }));
+    const result = await fetchVoiceList();
+    expect(result.map(v => v.name)).toEqual(["alloy", "shimmer"]);
+  });
+
+  it("parses bare array [{ id }] (OpenAI models-style via data key)", async () => {
+    process.env.TTS_HOST = "http://openai.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [{ id: "tts-1" }, { id: "tts-1-hd" }] }),
+    }));
+    const result = await fetchVoiceList();
+    expect(result.map(v => v.name)).toEqual(["tts-1", "tts-1-hd"]);
+  });
+
+  it("parses bare string array", async () => {
+    process.env.TTS_HOST = "http://myserver.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(["voice-a", "voice-b"]),
+    }));
+    const result = await fetchVoiceList();
+    expect(result.map(v => v.name)).toEqual(["voice-a", "voice-b"]);
+  });
+
+  it("returns empty array for unknown response shape", async () => {
+    process.env.TTS_HOST = "http://myserver.local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ unknown: "structure" }),
+    }));
+    const result = await fetchVoiceList();
+    expect(result).toEqual([]);
+  });
+
+  it("strips trailing slash from TTS_HOST before building voices URL", async () => {
+    process.env.TTS_HOST = "http://kokoro.local/";
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+    await fetchVoiceList();
+    expect(mockFetch.mock.calls[0][0]).toBe("http://kokoro.local/v1/audio/voices");
   });
 });

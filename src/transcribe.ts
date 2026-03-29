@@ -11,7 +11,12 @@
  */
 
 import { pipeline, env, type AutomaticSpeechRecognitionPipeline } from "@huggingface/transformers";
-import { getApi, resolveChat } from "./telegram.js";
+import { getApi, resolveChat, trySetMessageReaction, type ReactionEmoji } from "./telegram.js";
+
+const RE_TRAILING_SLASHES = /\/+$/;
+
+const REACT_TRANSCRIBING = "\u270D" as ReactionEmoji;  // ✍  Writing Hand
+const REACT_DONE         = "\uD83E\uDEE1" as ReactionEmoji; // 🫡  Saluting Face
 
 const LOCAL_MODEL = process.env.WHISPER_MODEL ?? "onnx-community/whisper-base";
 const REMOTE_MODEL = process.env.WHISPER_MODEL ?? "whisper-1";
@@ -23,29 +28,32 @@ if (process.env.WHISPER_CACHE_DIR) {
 }
 
 // Singleton pipeline — model is loaded once and reused across calls.
-let _pipelinePromise: Promise<AutomaticSpeechRecognitionPipeline> | null = null;
+const ASR_TASK = "automatic-speech-recognition";
+type ASRPipeline = AutomaticSpeechRecognitionPipeline;
+let _pipelinePromise: Promise<ASRPipeline> | null = null;
 
-function getPipeline() {
-  if (!_pipelinePromise) {
-    _pipelinePromise = pipeline("automatic-speech-recognition", LOCAL_MODEL) as Promise<AutomaticSpeechRecognitionPipeline>;
-  }
-  return _pipelinePromise;
+function getPipeline(): Promise<ASRPipeline> {
+  return _pipelinePromise ??= pipeline(ASR_TASK, LOCAL_MODEL);
 }
 
 /**
  * Sends raw audio bytes to an OpenAI-compatible transcription endpoint.
  * The server receives the bytes as a multipart file upload.
  */
-async function transcribeRemote(audioBytes: Buffer, filename: string): Promise<string> {
-  const host = process.env.STT_HOST!.replace(/\/$/, "");
+async function transcribeRemote(audioBytes: Buffer, filename: string, host: string): Promise<string> {
+  host = host.replace(RE_TRAILING_SLASHES, "");
   const url = `${host}/v1/audio/transcriptions`;
 
   const form = new FormData();
-  form.append("file", new Blob([audioBytes]), filename);
+  form.append("file", new Blob([new Uint8Array(audioBytes)]), filename);
   form.append("model", REMOTE_MODEL);
 
   const res = await fetch(url, { method: "POST", body: form });
-  if (!res.ok) throw new Error(`Whisper server error: ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "(no body)");
+    process.stderr.write(`[stt] server error ${res.status}: ${body}\n`);
+    throw new Error(`Whisper server returned ${res.status}. Check server logs for details.`);
+  }
   const json = await res.json() as { text: string };
   return json.text.trim();
 }
@@ -56,11 +64,15 @@ async function transcribeRemote(audioBytes: Buffer, filename: string): Promise<s
  */
 async function decodeAudioToFloat32(audioBytes: Buffer): Promise<Float32Array> {
   // audio-decode is ESM-only, dynamic import required
-  const { default: decode } = await import("audio-decode");
+  interface DecodedAudio {
+    channelData: Float32Array[];
+    sampleRate: number;
+  }
+  const { default: decode } = await import("audio-decode") as { default: (buf: Buffer) => Promise<DecodedAudio> };
   const audioBuffer = await decode(audioBytes);
 
   // Take the first channel
-  const channelData = audioBuffer.getChannelData(0);
+  const channelData = audioBuffer.channelData[0]!
 
   // Resample to 16 kHz if needed
   if (audioBuffer.sampleRate === SAMPLE_RATE) {
@@ -100,7 +112,7 @@ export async function transcribeVoice(fileId: string): Promise<string> {
   // 3a. Remote transcription — forward raw bytes, no local decode.
   if (process.env.STT_HOST) {
     const filename = fileInfo.file_path.split("/").pop() ?? "audio.ogg";
-    return transcribeRemote(audioBytes, filename);
+    return transcribeRemote(audioBytes, filename, process.env.STT_HOST);
   }
 
   // 3b. Local ONNX fallback — decode audio to Float32 PCM at 16 kHz.
@@ -119,26 +131,21 @@ export async function transcribeVoice(fileId: string): Promise<string> {
 }
 
 /**
- * Reacts to the voice message with 📝, transcribes it, then swaps the
+ * Reacts to the voice message with ✍, transcribes it, then swaps the
  * reaction to 🫡. Returns the transcribed text.
  * If reactions fail, transcription still proceeds.
  */
 export async function transcribeWithIndicator(fileId: string, messageId?: number): Promise<string> {
   const chatId = resolveChat();
+  const reactId = typeof chatId === "number" ? chatId : undefined;
 
-  // React with 📝 to signal transcription in progress (best-effort)
-  if (typeof chatId === "string" && messageId !== undefined) {
-    getApi().setMessageReaction(chatId, messageId, [{ type: "emoji", emoji: "✍" }])
-      .catch(() => {/* non-fatal */});
-  }
+  if (reactId !== undefined && messageId !== undefined)
+    void trySetMessageReaction(reactId, messageId, REACT_TRANSCRIBING);
 
   try {
     return await transcribeVoice(fileId);
   } finally {
-    // Swap reaction to 🫡 when done (best-effort)
-    if (typeof chatId === "string" && messageId !== undefined) {
-      getApi().setMessageReaction(chatId, messageId, [{ type: "emoji", emoji: "🫡" }])
-        .catch(() => {/* non-fatal */});
-    }
+    if (reactId !== undefined && messageId !== undefined)
+      void trySetMessageReaction(reactId, messageId, REACT_DONE);
   }
 }

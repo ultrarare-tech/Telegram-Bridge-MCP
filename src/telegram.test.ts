@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
-import { GrammyError } from "grammy";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { GrammyError, Api } from "grammy";
+import type { Update, ResponseParameters } from "grammy/types";
+import { tmpdir } from "os";
+import { resolve, join } from "path";
+import { writeFileSync, mkdirSync, rmSync } from "fs";
 import {
   validateText,
   validateCaption,
@@ -8,17 +12,32 @@ import {
   toError,
   splitMessage,
   callApi,
+  filterAllowedUpdates,
+  resetSecurityConfig,
+  unauthorizedSenderError,
+  resolveChat,
+  getOffset,
+  advanceOffset,
+  resetOffset,
+  fireHijackNotification,
+  resetApi,
+  sendVoiceDirect,
+  ackVoiceMessage,
+  recordRateLimitHit,
+  getRateLimitRemaining,
+  clearRateLimitForTest,
   LIMITS,
+  type TelegramError,
 } from "./telegram.js";
 
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
-function makeGrammyError(error_code: number, description: string): GrammyError {
+function makeGrammyError(error_code: number, description: string, parameters?: ResponseParameters): GrammyError {
   return new GrammyError(
     description,
-    { ok: false, error_code, description },
+    { ok: false, error_code, description, ...(parameters !== undefined && { parameters }) },
     "sendMessage",
     {}
   );
@@ -142,6 +161,7 @@ describe("toError with GrammyError", () => {
     ["message cant be edited",  400, "Bad Request: message can't be edited",         "MESSAGE_CANT_BE_EDITED"],
     ["message cant be deleted", 400, "Bad Request: message can't be deleted",        "MESSAGE_CANT_BE_DELETED"],
     ["button data invalid",     400, "Bad Request: BUTTON_DATA_INVALID",             "BUTTON_DATA_INVALID"],
+    ["409 Conflict",            409, "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running", "DUAL_INSTANCE_CONFLICT"],
   ];
 
   it.each(cases)("%s → %s", (_label, httpCode, description, expectedCode) => {
@@ -151,8 +171,7 @@ describe("toError with GrammyError", () => {
   });
 
   it("classifies 429 as RATE_LIMITED with retry_after", () => {
-    const err = makeGrammyError(429, "Too Many Requests: retry after 5");
-    (err as any).parameters = { retry_after: 5 };
+    const err = makeGrammyError(429, "Too Many Requests: retry after 5", { retry_after: 5 });
     const result = toError(err);
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.code).toBe("RATE_LIMITED");
@@ -248,6 +267,15 @@ describe("splitMessage", () => {
 // ---------------------------------------------------------------------------
 
 describe("callApi", () => {
+  beforeEach(() => {
+    clearRateLimitForTest();
+  });
+
+  afterEach(() => {
+    clearRateLimitForTest();
+    vi.useRealTimers();
+  });
+
   it("returns the result of a successful call", async () => {
     const fn = vi.fn().mockResolvedValue(42);
     expect(await callApi(fn)).toBe(42);
@@ -258,11 +286,10 @@ describe("callApi", () => {
     vi.useFakeTimers();
     const rateLimitErr = new GrammyError(
       "Too Many Requests",
-      { ok: false, error_code: 429, description: "Too Many Requests: retry after 1" },
+      { ok: false, error_code: 429, description: "Too Many Requests: retry after 1", parameters: { retry_after: 1 } },
       "sendMessage",
       {}
     );
-    (rateLimitErr as any).parameters = { retry_after: 1 };
 
     const fn = vi.fn()
       .mockRejectedValueOnce(rateLimitErr)
@@ -272,7 +299,6 @@ describe("callApi", () => {
     await vi.runAllTimersAsync();
     expect(await promise).toBe("ok");
     expect(fn).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
   });
 
   it("throws immediately for non-rate-limit GrammyError", async () => {
@@ -291,11 +317,10 @@ describe("callApi", () => {
     vi.useFakeTimers();
     const rateLimitErr = new GrammyError(
       "Too Many Requests",
-      { ok: false, error_code: 429, description: "Too Many Requests: retry after 1" },
+      { ok: false, error_code: 429, description: "Too Many Requests: retry after 1", parameters: { retry_after: 1 } },
       "sendMessage",
       {}
     );
-    (rateLimitErr as any).parameters = { retry_after: 1 };
 
     const fn = vi.fn().mockRejectedValue(rateLimitErr);
     const promise = callApi(fn, 2);
@@ -306,6 +331,484 @@ describe("callApi", () => {
     ]);
     // Called once initially + 2 retries = 3 total
     expect(fn).toHaveBeenCalledTimes(3);
-    vi.useRealTimers();
+  });
+
+  it("pre-check: fails fast when inside a known rate limit window", async () => {
+    recordRateLimitHit(30); // 30-second window
+    const fn = vi.fn().mockResolvedValue("ok");
+    await expect(callApi(fn)).rejects.toBeInstanceOf(GrammyError);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("pre-check: records rate limit window when 429 is encountered", async () => {
+    vi.useFakeTimers();
+    const rateLimitErr = new GrammyError(
+      "Too Many Requests",
+      { ok: false, error_code: 429, description: "Too Many Requests: retry after 10", parameters: { retry_after: 10 } },
+      "sendMessage",
+      {}
+    );
+    const fn = vi.fn().mockRejectedValueOnce(rateLimitErr).mockResolvedValue("ok");
+    const promise = callApi(fn);
+
+    // Flush microtasks: let fn() run, 429 be caught, recordRateLimit(10) be invoked.
+    // The callApi loop is now awaiting a 10 s timer — timers are still frozen.
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Rate-limit window must be recorded immediately after the 429 is caught
+    expect(getRateLimitRemaining()).toBeGreaterThan(0);
+    expect(getRateLimitRemaining()).toBeLessThanOrEqual(10);
+
+    // Advance past the retry window so the retry fires and callApi resolves
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // The retry_after window has elapsed — no longer rate limited
+    expect(getRateLimitRemaining()).toBe(0);
+  });
+
+  it("pre-check: resumes after window expires", async () => {
+    vi.useFakeTimers();
+    recordRateLimitHit(5); // 5-second window
+
+    const fn = vi.fn().mockResolvedValue("ok");
+
+    // Inside window: should fail fast
+    await expect(callApi(fn)).rejects.toBeInstanceOf(GrammyError);
+    expect(fn).not.toHaveBeenCalled();
+
+    // Advance past the window
+    await vi.advanceTimersByTimeAsync(6000);
+
+    // Now should succeed
+    const result = await callApi(fn);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limit tracking
+// ---------------------------------------------------------------------------
+
+describe("rate limit tracking", () => {
+  beforeEach(() => { clearRateLimitForTest(); });
+  afterEach(() => { clearRateLimitForTest(); vi.useRealTimers(); });
+
+  it("getRateLimitRemaining returns 0 when not rate limited", () => {
+    expect(getRateLimitRemaining()).toBe(0);
+  });
+
+  it("recordRateLimitHit sets a positive remaining time", () => {
+    recordRateLimitHit(10);
+    expect(getRateLimitRemaining()).toBeGreaterThan(0);
+    expect(getRateLimitRemaining()).toBeLessThanOrEqual(10);
+  });
+
+  it("extends the window if a longer retry_after arrives", () => {
+    recordRateLimitHit(5);
+    const first = getRateLimitRemaining();
+    recordRateLimitHit(60);
+    const second = getRateLimitRemaining();
+    expect(second).toBeGreaterThan(first);
+  });
+
+  it("does NOT shorten the window if a smaller retry_after arrives", () => {
+    recordRateLimitHit(60);
+    const first = getRateLimitRemaining();
+    recordRateLimitHit(5);
+    const second = getRateLimitRemaining();
+    expect(second).toBeGreaterThanOrEqual(first - 1); // allow 1s rounding
+  });
+
+  it("returns 0 after window expires", async () => {
+    vi.useFakeTimers();
+    recordRateLimitHit(1);
+    expect(getRateLimitRemaining()).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(getRateLimitRemaining()).toBe(0);
+  });
+
+  it("clearRateLimitForTest resets the window", () => {
+    recordRateLimitHit(60);
+    clearRateLimitForTest();
+    expect(getRateLimitRemaining()).toBe(0);
+  });
+
+  it("recordRateLimitHit with undefined uses 5s fallback", () => {
+    recordRateLimitHit(undefined);
+    expect(getRateLimitRemaining()).toBeGreaterThan(0);
+    expect(getRateLimitRemaining()).toBeLessThanOrEqual(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// filterAllowedUpdates
+// ---------------------------------------------------------------------------
+
+describe("filterAllowedUpdates", () => {
+  beforeEach(() => {
+    delete process.env.ALLOWED_USER_ID;
+    resetSecurityConfig();
+  });
+
+  afterEach(() => {
+    delete process.env.ALLOWED_USER_ID;
+    resetSecurityConfig();
+  });
+
+  function makeMessageUpdate(userId: number, chatId: number): Update {
+    return { message: { from: { id: userId }, chat: { id: chatId } } } as unknown as Update;
+  }
+
+  function makeCallbackUpdate(userId: number, chatId: number): Update {
+    return { callback_query: { from: { id: userId }, message: { chat: { id: chatId } } } } as unknown as Update;
+  }
+
+  it("passes all updates through when no filters are configured", () => {
+    const updates = [makeMessageUpdate(1, 100), makeMessageUpdate(2, 200)];
+    expect(filterAllowedUpdates(updates)).toHaveLength(2);
+  });
+
+  it("filters by userId: keeps matching sender", () => {
+    process.env.ALLOWED_USER_ID = "42";
+    resetSecurityConfig();
+    const updates = [makeMessageUpdate(42, 100), makeMessageUpdate(99, 100)];
+    const result = filterAllowedUpdates(updates);
+    expect(result).toHaveLength(1);
+    expect(result[0].message?.from?.id).toBe(42);
+  });
+
+  it("filters by userId: drops update with no sender (senderId undefined)", () => {
+    process.env.ALLOWED_USER_ID = "42";
+    resetSecurityConfig();
+    const noSender = { message: { chat: { id: 100 } } } as unknown as Update; // from is absent
+    expect(filterAllowedUpdates([noSender])).toHaveLength(0);
+  });
+
+  it("userId filter passes updates from any chat (no chat filtering)", () => {
+    process.env.ALLOWED_USER_ID = "42";
+    resetSecurityConfig();
+    const sameChat = makeMessageUpdate(42, 100);
+    const diffChat = makeMessageUpdate(42, 999); // same user, different chat — still passes
+    const wrongUser = makeMessageUpdate(99, 100);
+    const result = filterAllowedUpdates([sameChat, diffChat, wrongUser]);
+    expect(result).toHaveLength(2);
+    expect(result.every((u) => u.message?.from?.id === 42)).toBe(true);
+  });
+
+  it("handles callback_query updates with userId filter", () => {
+    process.env.ALLOWED_USER_ID = "7";
+    resetSecurityConfig();
+    const match = makeCallbackUpdate(7, 50);
+    const mismatch = makeCallbackUpdate(8, 50);
+    const result = filterAllowedUpdates([match, mismatch]);
+    expect(result).toHaveLength(1);
+    expect(result[0].callback_query?.from?.id).toBe(7);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// unauthorizedSenderError
+// ---------------------------------------------------------------------------
+
+describe("unauthorizedSenderError", () => {
+  it("includes the sender id in the message", () => {
+    const err = unauthorizedSenderError(42);
+    expect(err.code).toBe("UNAUTHORIZED_SENDER");
+    expect(err.message).toContain("42");
+  });
+
+  it("falls back to 'unknown' when fromId is undefined", () => {
+    const err = unauthorizedSenderError(undefined);
+    expect(err.message).toContain("unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveChat
+// ---------------------------------------------------------------------------
+
+describe("resolveChat", () => {
+  beforeEach(() => {
+    delete process.env.ALLOWED_USER_ID;
+    resetSecurityConfig();
+  });
+
+  afterEach(() => {
+    delete process.env.ALLOWED_USER_ID;
+    resetSecurityConfig();
+  });
+
+  it("returns UNAUTHORIZED_CHAT error when ALLOWED_USER_ID is not set", () => {
+    const result = resolveChat();
+    expect(typeof result).toBe("object");
+    expect((result as TelegramError).code).toBe("UNAUTHORIZED_CHAT");
+  });
+
+  it("returns userId as the chat target when ALLOWED_USER_ID is set", () => {
+    process.env.ALLOWED_USER_ID = "12345";
+    resetSecurityConfig();
+    expect(resolveChat()).toBe(12345);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getOffset / advanceOffset / resetOffset
+// ---------------------------------------------------------------------------
+
+describe("offset management", () => {
+  beforeEach(() => {
+    resetOffset();
+    process.env.HIJACK_NOTIFY = "console"; // pin to console-only for deterministic spy assertions
+  });
+  afterEach(() => {
+    resetOffset();
+    delete process.env.HIJACK_NOTIFY;
+  });
+
+  it("getOffset returns 0 initially", () => {
+    expect(getOffset()).toBe(0);
+  });
+
+  it("advanceOffset sets offset to max update_id + 1", () => {
+    advanceOffset([{ update_id: 5 } as unknown as Update, { update_id: 3 } as unknown as Update]);
+    expect(getOffset()).toBe(6);
+  });
+
+  it("advanceOffset is a no-op for empty array", () => {
+    expect(advanceOffset([])).toBeNull();
+    expect(getOffset()).toBe(0);
+  });
+
+  it("resetOffset resets to 0", () => {
+    advanceOffset([{ update_id: 10 } as unknown as Update]);
+    resetOffset();
+    expect(getOffset()).toBe(0);
+  });
+
+  it("returns warning string when update_id gap is detected", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    advanceOffset([{ update_id: 10 } as unknown as Update]); // offset → 11
+    const result = advanceOffset([{ update_id: 15 } as unknown as Update]); // gap
+    expect(result).not.toBeNull();
+    expect(result).toContain("Update ID gap detected");
+    expect(result).toContain("may have been consumed");
+    expect(spy).toHaveBeenCalledOnce();
+    expect(spy.mock.calls[0][0]).toContain("Update ID gap detected");
+    spy.mockRestore();
+  });
+
+  it("returns null on the first poll (offset = 0)", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = advanceOffset([{ update_id: 50 } as unknown as Update]);
+    expect(result).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("returns null for a contiguous batch", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    advanceOffset([{ update_id: 10 } as unknown as Update]); // offset → 11
+    const result = advanceOffset([{ update_id: 11 } as unknown as Update]);
+    expect(result).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fireHijackNotification — Telegram send path
+// ---------------------------------------------------------------------------
+
+describe("fireHijackNotification", () => {
+  let sendMessageSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    sendMessageSpy = vi
+      .spyOn(Api.prototype, "sendMessage")
+      .mockResolvedValue({} as never);
+    process.env.BOT_TOKEN = "test_token";
+  });
+
+  afterEach(() => {
+    sendMessageSpy.mockRestore();
+    delete process.env.BOT_TOKEN;
+    delete process.env.HIJACK_NOTIFY;
+    delete process.env.ALLOWED_USER_ID;
+    resetApi();
+    resetSecurityConfig();
+  });
+
+  it("sends to configured chat when HIJACK_NOTIFY includes 'telegram' and ALLOWED_USER_ID is set", () => {
+    process.env.HIJACK_NOTIFY = "telegram";
+    process.env.ALLOWED_USER_ID = "99999";
+    resetSecurityConfig();
+    fireHijackNotification("⚠️ test warning");
+    expect(sendMessageSpy).toHaveBeenCalledOnce();
+    expect(sendMessageSpy.mock.calls[0][0]).toBe(99999);
+    expect(sendMessageSpy.mock.calls[0][1]).toBe("⚠️ test warning");
+  });
+
+  it("skips Telegram send when ALLOWED_USER_ID is not configured", () => {
+    process.env.HIJACK_NOTIFY = "telegram";
+    resetSecurityConfig();
+    fireHijackNotification("⚠️ test warning");
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+  });
+
+  it("swallows sendMessage rejection without throwing", async () => {
+    sendMessageSpy.mockRejectedValue(new Error("network error"));
+    process.env.HIJACK_NOTIFY = "telegram";
+    process.env.ALLOWED_USER_ID = "99999";
+    resetSecurityConfig();
+    // fire-and-forget — must not throw
+    expect(() => { fireHijackNotification("⚠️ test warning"); }).not.toThrow();
+    // verify the send was actually attempted
+    expect(sendMessageSpy).toHaveBeenCalledOnce();
+    // flush microtask queue so the rejection is handled and swallowed
+    await Promise.resolve();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendVoiceDirect — path restriction
+// ---------------------------------------------------------------------------
+
+describe("sendVoiceDirect path restriction", () => {
+  const SAFE_DIR = resolve(tmpdir(), "telegram-bridge-mcp");
+  const safeFile = join(SAFE_DIR, "test-voice.ogg");
+
+  beforeEach(() => {
+    mkdirSync(SAFE_DIR, { recursive: true });
+    writeFileSync(safeFile, Buffer.from([0x4f, 0x67, 0x67, 0x53])); // OggS header
+  });
+
+  afterEach(() => {
+    rmSync(safeFile, { force: true });
+  });
+
+  it("throws when voice path escapes the safe directory via ../", async () => {
+    process.env.BOT_TOKEN = "bot_test_token";
+    // create the target file so existsSync passes — the path check must fire
+    const parentDir = resolve(tmpdir());
+    const escapedTarget = join(parentDir, "escaped.ogg");
+    writeFileSync(escapedTarget, Buffer.from([0]));
+    try {
+      await expect(
+        sendVoiceDirect("123", escapedTarget)
+      ).rejects.toThrow(/Local file read restricted/);
+    } finally {
+      rmSync(escapedTarget, { force: true });
+      delete process.env.BOT_TOKEN;
+    }
+  });
+
+  it("throws when voice path is a sibling directory with same prefix", async () => {
+    // e.g. 'telegram-bridge-mcp2' should not be allowed
+    process.env.BOT_TOKEN = "bot_test_token";
+    const siblingDir = resolve(tmpdir(), "telegram-bridge-mcp2");
+    mkdirSync(siblingDir, { recursive: true });
+    const siblingFile = join(siblingDir, "voice.ogg");
+    writeFileSync(siblingFile, Buffer.from([0]));
+    try {
+      await expect(
+        sendVoiceDirect("123", siblingFile)
+      ).rejects.toThrow(/Local file read restricted/);
+    } finally {
+      rmSync(siblingFile, { force: true });
+      rmSync(siblingDir, { recursive: true, force: true });
+      delete process.env.BOT_TOKEN;
+    }
+  });
+
+  it("reads the file without throwing when path is inside SAFE_FILE_DIR", async () => {
+    // No BOT_TOKEN set — will throw after the path check passes.
+    // We just need to confirm the error is about BOT_TOKEN, not path restriction.
+    delete process.env.BOT_TOKEN;
+    await expect(
+      sendVoiceDirect("123", safeFile)
+    ).rejects.toThrow(/BOT_TOKEN/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ackVoiceMessage — fire-and-forget 🫡 reaction
+// ---------------------------------------------------------------------------
+import { getBotReaction, recordBotReaction, resetStoreForTest } from "./message-store.js";
+
+describe("ackVoiceMessage", () => {
+  let setMessageReactionSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    process.env.BOT_TOKEN = "test_token";
+    process.env.ALLOWED_USER_ID = "12345";
+    resetSecurityConfig();
+    resetApi();
+    resetStoreForTest();
+    setMessageReactionSpy = vi
+      .spyOn(Api.prototype, "setMessageReaction")
+      .mockResolvedValue(true as unknown as never);
+  });
+
+  afterEach(() => {
+    setMessageReactionSpy.mockRestore();
+    delete process.env.BOT_TOKEN;
+    delete process.env.ALLOWED_USER_ID;
+    resetApi();
+    resetSecurityConfig();
+    resetStoreForTest();
+  });
+
+  it("calls setMessageReaction with 🫡 for the given message id", async () => {
+    ackVoiceMessage(100);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setMessageReactionSpy).toHaveBeenCalledWith(
+      12345, 100, [{ type: "emoji", emoji: "🫡" }],
+    );
+  });
+
+  it("records 🫡 in the bot reaction index on success", async () => {
+    ackVoiceMessage(101);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getBotReaction(101)).toBe("🫡");
+  });
+
+  it("is a no-op when resolveChat returns a non-number (no ALLOWED_USER_ID)", () => {
+    delete process.env.ALLOWED_USER_ID;
+    resetSecurityConfig();
+    ackVoiceMessage(102);
+    // synchronous guard — if we got here without throwing, the check passed.
+    // The spy must NOT have been called (even after async flush it won't fire).
+    expect(setMessageReactionSpy).not.toHaveBeenCalled();
+  });
+
+  it("skips the API call when 🫡 is already in the bot reaction index (dedup)", async () => {
+    // Edge case #5: pre-set the reaction so the dedup guard fires
+    recordBotReaction(103, "🫡");
+    ackVoiceMessage(103);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setMessageReactionSpy).not.toHaveBeenCalled();
+  });
+
+  it("writes to stderr and does NOT record reaction when API call fails", async () => {
+    setMessageReactionSpy.mockRejectedValue(new Error("api error"));
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    ackVoiceMessage(104);
+    // Three microtask ticks: Promise.race → .then(ok → ..., () => false) → .then(ok => { ...stderr... })
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining("🫡 failed for msg 104"),
+    );
+    expect(getBotReaction(104)).toBeNull();
+    stderrSpy.mockRestore();
   });
 });

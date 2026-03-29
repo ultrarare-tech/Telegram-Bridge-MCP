@@ -15,6 +15,18 @@ describe("markdownToV2", () => {
     expect(markdownToV2("_hi_")).toBe("_hi_");
   });
 
+  it("escapes underscore bounded by word chars — identifier context", () => {
+    // Single underscore between alphanumeric chars must be escaped, not treated as italic
+    expect(markdownToV2("STT_HOST")).toBe("STT\\_HOST");
+    expect(markdownToV2("TTS_HOST and STT_HOST")).toBe("TTS\\_HOST and STT\\_HOST");
+    expect(markdownToV2("my_var_name")).toBe("my\\_var\\_name");
+  });
+
+  it("still converts real _italic_ when not bounded by word chars", () => {
+    expect(markdownToV2("_italic text_")).toBe("_italic text_");
+    expect(markdownToV2("use _emphasis_ here")).toBe("use _emphasis_ here");
+  });
+
   it("converts __underline__", () => {
     expect(markdownToV2("__under__")).toBe("__under__");
   });
@@ -96,6 +108,16 @@ describe("markdownToV2", () => {
     const out = markdownToV2(input);
     expect(out).toContain("C:\\");
     expect(out).not.toContain("C:\\\\\\\\");
+  });
+
+  it("normalizes agent-escaped underscores in bold text", () => {
+    // Agents often write **send\_confirmation** — the \_ must become _ before
+    // the bold tokeniser applies MarkdownV2 escaping, so Telegram shows
+    // "send_confirmation" not "send\_confirmation".
+    const input = "**send\\_confirmation** is the tool";
+    const out = markdownToV2(input);
+    expect(out).toContain("*send\\_confirmation*");
+    expect(out).not.toContain("send\\\\_confirmation");
   });
 
   it("real-world: confirmation text with escaped quotes passes through cleanly", () => {

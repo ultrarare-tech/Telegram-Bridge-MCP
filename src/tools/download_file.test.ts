@@ -1,19 +1,26 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createMockServer, parseResult, isError } from "./test-utils.js";
+import { createMockServer, parseResult, isError, errorCode } from "./test-utils.js";
 
 // ---------------------------------------------------------------------------
 // Hoisted mocks - must be at top
 // ---------------------------------------------------------------------------
+const FAKE_TMPDIR = vi.hoisted(() => "/tmp/fake");
+
 const mocks = vi.hoisted(() => ({
+  activeSessionCount: vi.fn(() => 0),
+  getActiveSession: vi.fn(() => 0),
+  validateSession: vi.fn(() => false),
   getFile: vi.fn(),
   writeFile: vi.fn(),
   mkdir: vi.fn(),
 }));
 
-const FAKE_TMPDIR = "/tmp/fake";
+vi.mock("os", () => ({
+  tmpdir: () => FAKE_TMPDIR,
+}));
 
 vi.mock("../telegram.js", async (importActual) => {
-  const actual = await importActual<typeof import("../telegram.js")>();
+  const actual = await importActual<Record<string, unknown>>();
   return { ...actual, getApi: () => mocks };
 });
 
@@ -22,8 +29,10 @@ vi.mock("fs/promises", () => ({
   mkdir: mocks.mkdir,
 }));
 
-vi.mock("os", () => ({
-  tmpdir: () => FAKE_TMPDIR,
+vi.mock("../session-manager.js", () => ({
+  activeSessionCount: () => mocks.activeSessionCount(),
+  getActiveSession: () => mocks.getActiveSession(),
+  validateSession: mocks.validateSession,
 }));
 
 // Mock global fetch
@@ -31,25 +40,31 @@ const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 
 import { register } from "./download_file.js";
+import { resetSecurityConfig } from "../telegram.js";
 
 describe("download_file tool", () => {
   let call: (args: Record<string, unknown>) => Promise<unknown>;
 
-  const tokenBefore = process.env.BOT_TOKEN;
+  const envBefore = { BOT_TOKEN: process.env.BOT_TOKEN, ALLOWED_USER_ID: process.env.ALLOWED_USER_ID };
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.validateSession.mockReturnValue(true);
     process.env.BOT_TOKEN = "testtoken123";
+    process.env.ALLOWED_USER_ID = "12345";
+    resetSecurityConfig();
     mocks.mkdir.mockResolvedValue(undefined);
     mocks.writeFile.mockResolvedValue(undefined);
 
     const server = createMockServer();
-    register(server as any);
+    register(server);
     call = server.getHandler("download_file");
   });
 
   afterEach(() => {
-    process.env.BOT_TOKEN = tokenBefore;
+    process.env.BOT_TOKEN = envBefore.BOT_TOKEN;
+    process.env.ALLOWED_USER_ID = envBefore.ALLOWED_USER_ID;
+    resetSecurityConfig();
   });
 
   // -------------------------------------------------------------------------
@@ -62,10 +77,10 @@ describe("download_file tool", () => {
       arrayBuffer: () => Promise.resolve(pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength)),
     });
 
-    const result = await call({ file_id: "fileABC", file_name: "report.pdf", mime_type: "application/pdf" });
+    const result = await call({ file_id: "fileABC", file_name: "report.pdf", mime_type: "application/pdf", identity: [1, 123456]});
 
     expect(isError(result)).toBe(false);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.local_path).toContain("report.pdf");
     expect(data.file_name).toBe("report.pdf");
     expect(data.mime_type).toBe("application/pdf");
@@ -87,9 +102,9 @@ describe("download_file tool", () => {
       arrayBuffer: () => Promise.resolve(jpgBytes.buffer.slice(jpgBytes.byteOffset, jpgBytes.byteOffset + jpgBytes.byteLength)),
     });
 
-    const result = await call({ file_id: "imgXYZ" });
+    const result = await call({ file_id: "imgXYZ", identity: [1, 123456]});
     expect(isError(result)).toBe(false);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.file_name).toBe("file_123.jpg");
   });
 
@@ -102,9 +117,9 @@ describe("download_file tool", () => {
       arrayBuffer: () => Promise.resolve(txtBuf.buffer.slice(txtBuf.byteOffset, txtBuf.byteOffset + txtBuf.byteLength)),
     });
 
-    const result = await call({ file_id: "txtID", file_name: "notes.txt" });
+    const result = await call({ file_id: "txtID", file_name: "notes.txt", identity: [1, 123456]});
     expect(isError(result)).toBe(false);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.text).toBe(content);
   });
 
@@ -117,9 +132,9 @@ describe("download_file tool", () => {
       arrayBuffer: () => Promise.resolve(csvBuf.buffer.slice(csvBuf.byteOffset, csvBuf.byteOffset + csvBuf.byteLength)),
     });
 
-    const result = await call({ file_id: "csvID", file_name: "data.bin", mime_type: "text/csv" });
+    const result = await call({ file_id: "csvID", file_name: "data.bin", mime_type: "text/csv", identity: [1, 123456]});
     expect(isError(result)).toBe(false);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.text).toBe(content);
   });
 
@@ -132,34 +147,59 @@ describe("download_file tool", () => {
       arrayBuffer: () => Promise.resolve(bigBuf.buffer.slice(bigBuf.byteOffset, bigBuf.byteOffset + bigBuf.byteLength)),
     });
 
-    const result = await call({ file_id: "bigTxt", file_name: "big.txt" });
+    const result = await call({ file_id: "bigTxt", file_name: "big.txt", identity: [1, 123456]});
     expect(isError(result)).toBe(false);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.text).toBeUndefined();
   });
 
   it("returns error when BOT_TOKEN is missing", async () => {
     delete process.env.BOT_TOKEN;
-    const result = await call({ file_id: "anyID" });
+    const result = await call({ file_id: "anyID", identity: [1, 123456]});
     expect(isError(result)).toBe(true);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.message).toMatch(/BOT_TOKEN/);
   });
 
   it("returns error when Telegram returns no file_path", async () => {
     mocks.getFile.mockResolvedValue({});
-    const result = await call({ file_id: "noPath" });
+    const result = await call({ file_id: "noPath", identity: [1, 123456]});
     expect(isError(result)).toBe(true);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.message).toMatch(/file_path/);
   });
 
   it("returns error when download HTTP request fails", async () => {
     mocks.getFile.mockResolvedValue({ file_path: "documents/x.pdf" });
     fetchMock.mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" });
-    const result = await call({ file_id: "failID", file_name: "x.pdf" });
+    const result = await call({ file_id: "failID", file_name: "x.pdf", identity: [1, 123456]});
     expect(isError(result)).toBe(true);
-    const data = parseResult(result) as any;
+    const data = parseResult(result);
     expect(data.message).toMatch(/404/);
   });
+
+describe("identity gate", () => {
+  it("returns SID_REQUIRED when no identity provided", async () => {
+    const result = await call({"file_id":"x"});
+    expect(isError(result)).toBe(true);
+    expect(errorCode(result)).toBe("SID_REQUIRED");
+  });
+
+  it("returns AUTH_FAILED when identity has wrong pin", async () => {
+    mocks.validateSession.mockReturnValueOnce(false);
+    const result = await call({"file_id":"x","identity":[1,99999]});
+    expect(isError(result)).toBe(true);
+    expect(errorCode(result)).toBe("AUTH_FAILED");
+  });
+
+  it("proceeds when identity is valid", async () => {
+    mocks.validateSession.mockReturnValueOnce(true);
+    let code: string | undefined;
+    try { code = errorCode(await call({"file_id":"x","identity":[1,99999]})); } catch { /* gate passed, other error ok */ }
+    expect(code).not.toBe("SID_REQUIRED");
+    expect(code).not.toBe("AUTH_FAILED");
+  });
+
+});
+
 });

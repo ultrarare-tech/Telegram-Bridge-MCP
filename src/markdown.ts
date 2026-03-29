@@ -21,6 +21,13 @@
  */
 
 const V2_SPECIAL = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+const V2_SPECIAL_CHAR = /[_*[\]()~`>#+\-=|{}.!\\]/;
+const MCP_BACKSLASH_STASH = /\\\\/g;
+const MCP_MARKDOWN_UNESCAPE = /\\([_*~`[\]()>#+\-=|{}.!])/g;
+const FENCED_CODE_BLOCK = /```([^\n`]*)\n([\s\S]*?)```/g;
+const FENCED_CODE_UNCLOSED = /```([^\n`]*)\n([\s\S]*)$/;
+const BLOCKQUOTE_LINE = /^> ?(.+)$/gm;
+const ATX_HEADING = /^#{1,6} +(.+)$/gm;
 
 export function escapeV2(s: string): string {
   return s.replace(V2_SPECIAL, "\\$&");
@@ -47,14 +54,14 @@ export function resolveParseMode(
 export function markdownToV2(input: string, partial = true): string {
   // ── 0. Extract fenced code blocks FIRST so normalization never touches them ─
   const codeBlocks: string[] = [];
-  let text = input.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_m, lang, body) => {
+  let text = input.replace(FENCED_CODE_BLOCK, (_m: string, lang: string, body: string) => {
     const idx = codeBlocks.length;
     codeBlocks.push("```" + lang + "\n" + body.replace(/[\\`]/g, "\\$&") + "```");
     return `\x00CB${idx}\x00`;
   });
   // In partial mode, also capture unclosed fenced code blocks (no closing ```)
   if (partial) {
-    text = text.replace(/```([^\n`]*)\n([\s\S]*)$/, (_m, lang, body) => {
+    text = text.replace(FENCED_CODE_UNCLOSED, (_m: string, lang: string, body: string) => {
       const idx = codeBlocks.length;
       codeBlocks.push("```" + lang + "\n" + body.replace(/[\\`]/g, "\\$&") + "```");
       return `\x00CB${idx}\x00`;
@@ -65,21 +72,24 @@ export function markdownToV2(input: string, partial = true): string {
   //   \n  (two chars) → real newline
   //   \"  (two chars) → real double-quote  (agents JSON-escape quotes before passing)
   //   \\  (two chars) → real backslash     (agents double-escape backslashes)
+  //   \X  (where X is a Markdown-special char) → X  (agents escape _ * etc.)
   text = text
     .replace(/\\n/g, "\n")
     .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
+    .replace(MCP_BACKSLASH_STASH, "\x00BS\x00")       // stash real backslashes
+    .replace(MCP_MARKDOWN_UNESCAPE, "$1")
+    .replace(/\x00BS\x00/g, "\\");
 
   // ── 1b. Extract blockquote lines so > is never re-escaped ───────────────
   const blockquotes: string[] = [];
-  text = text.replace(/^> ?(.+)$/gm, (_m, content) => {
+  text = text.replace(BLOCKQUOTE_LINE, (_m: string, content: string) => {
     const idx = blockquotes.length;
     blockquotes.push(">" + escapeV2(content));
     return `\x00BQ${idx}\x00`;
   });
 
   // ── 2. Convert ATX headings to bold ─────────────────────────────────────
-  text = text.replace(/^#{1,6} +(.+)$/gm, (_m, content) => `*${escapeV2(content)}*`);
+  text = text.replace(ATX_HEADING, (_m: string, content: string) => `*${escapeV2(content)}*`);
 
   // ── 3. Inline tokeniser ─────────────────────────────────────────────────
   const out: string[] = [];
@@ -185,7 +195,16 @@ export function markdownToV2(input: string, partial = true): string {
     }
 
     // Italic  _text_  (single underscore)
+    // Guard: if preceded by a word char (letter/digit/_), the underscore is part
+    // of an identifier (e.g. STT_HOST, my_var) — escape it instead of treating
+    // it as an italic marker.  This prevents cross-word pairing like
+    // "TTS_HOST … STT_HOST" from accidentally rending as italic text.
     if (text[i] === "_" && text[i + 1] !== "_" && text[i + 1] !== " " && text[i + 1] !== "\n") {
+      if (i > 0 && /\w/.test(text[i - 1])) {
+        out.push("\\_");
+        i++;
+        continue;
+      }
       const nextNl = text.indexOf("\n", i + 1);
       const limit = nextNl === -1 ? text.length : nextNl;
       const end = text.indexOf("_", i + 1);
@@ -227,8 +246,7 @@ export function markdownToV2(input: string, partial = true): string {
 
     // Plain character — escape if it is a MarkdownV2 special char
     const ch = text[i];
-    out.push(V2_SPECIAL.test(ch) ? "\\" + ch : ch);
-    V2_SPECIAL.lastIndex = 0; // reset stateful regex after .test()
+    out.push(V2_SPECIAL_CHAR.test(ch) ? "\\" + ch : ch);
     i++;
   }
 

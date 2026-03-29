@@ -1,30 +1,68 @@
 # Telegram Loop Prompt
 
-Start a persistent Telegram chat loop using the available Telegram Bridge MCP tools.
+Start a persistent Telegram chat loop using the Telegram Bridge MCP tools.
 
-## Setup (once)
+## Channel Rule
 
-1. Call `get_agent_guide` — loads behavior rules and communication conventions.
-2. Read `telegram-bridge-mcp://quick-reference` — tool selection and hard rules.
-3. Call `get_update` in a loop until `remaining == 0` — drain stale messages one at a time.
-4. Send a **silent** `notify` that you're online and ready.
-5. Ask the operator whether they'd like the session recorded:
-   `send_confirmation("🧠 Enable temporary recall?", yes_text: "🔴 Record", no_text: "⬛ Skip")`
-   If **Yes**: call `start_session_recording(100)`, then read `SESSION-RECORDING.md` for full guidance on recording tools and workflows.
+Once the loop is active, Telegram is the conversational surface.
+Do not answer substantive operator messages in the VS Code chat panel.
+Use VS Code only for tool execution and hidden coordination.
+Return to VS Code chat only if the operator explicitly exits the loop or Telegram tools are unavailable.
 
-## Key Capabilities
+## Setup
 
-- **Voice responses** — Speak replies aloud via `send_message` with `voice: true` (requires TTS). Operators can listen while driving or multitasking. To send an existing audio file, use `send_voice` instead.
-- **Interactive buttons** — Use `send_confirmation` or `choose` for human-friendly Yes/No decisions and multi-option menus. Humans prefer clicking buttons over typing.
-- **Temporary Messages** — Use `send_temp_message` to indicate "Thinking...", "Investigating...", or "On it!". Humans like to know what's going on.
-- **Reactions** — Use `set_reaction` to help reflect acknowledgment or activity.
+1. Call `get_agent_guide`
+2. Read `telegram-bridge-mcp://communication-guide`
+3. Call `get_me` — if it fails, report the error to the user and stop
+4. `session_start` — intro + handles pending messages from previous session
+5. `dequeue_update` — enter the loop
 
-## The Loop
+## Loop
 
-```txt
-wait_for_message → show_typing (or send_temp_message) → do work → reply via Telegram → repeat
+→ receive
+→ react (if appropriate)
+→ `show_animation` (contextual:thinking)
+→ think
+→ `show_animation` (contextual:working)
+→ work
+→ `show_typing` (will cancel animation unless set to persistent)
+→ reply/interact
+→ `dequeue_update`
+
+## Canonical Recipe
+
+```text
+1. dequeue_update(timeout: 300)
+2. update arrives → handle it, reply in Telegram
+3. timed_out → call dequeue_update again (stay in loop)
+4. error → report in Telegram, then call dequeue_update again
 ```
 
-- On **timeout**: notify the operator (silent) that no message was received and you'll check again in 5 minutes, then wait 5 minutes before calling `wait_for_message` again. Double the interval on each successive timeout (5 min → 10 → 20 → …). Reset the interval when a message is received.
-- On **`exit`**: if recording is active, `dump_session_record(stop: true)` first, then send goodbye.
-- **All output**: send through Telegram — the operator is on their phone.
+Do not restart, shut down, re-bootstrap, or re-announce the session just because the operator says "resume the loop" or "stay in the loop." That means: call `dequeue_update` again.
+
+## Instruction Precedence
+
+When rules conflict, follow this order:
+
+1. Active operator instruction
+2. Loop-mode Telegram communication rules (this file + `telegram-communication.instructions.md`)
+3. Role prompt (Overseer / Worker / custom)
+4. General coding-agent defaults
+5. Memory notes — advisory only, not authoritative
+
+If memory conflicts with live tool state or current operator instruction, memory loses.
+
+## Visible Presence
+
+Use `show_animation` as the default "I am thinking / working" signal.
+Use `send_new_progress` only when you intend to update the same progress message over time.
+Use `send_new_checklist` only for real multi-step tracked workflows.
+Do not create progress or checklist artifacts for one-shot status signaling.
+
+## Common Failure Modes
+
+- Replying in VS Code chat while the loop is active
+- Restarting/recovering the session when a simple `dequeue_update` call would suffice
+- Trusting stale memory over live tool state (stored SID/PIN, old test counts, outdated board state)
+- Using progress/checklist tools for presence instead of `show_animation`
+- Deleting or mass-editing user-visible messages without explicit approval
